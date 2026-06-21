@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build standalone Windows executables for CryptoNote (ARM64 and x86)."""
+"""Build standalone Windows executables for CryptoNote."""
 
 import os
 import sys
@@ -7,11 +7,11 @@ import subprocess
 import shutil
 from pathlib import Path
 
-def build_exe(arch: str):
+def build_exe(arch):
     """Build exe for given architecture."""
-    print(f"\n{'='*60}")
+    print("\n" + "="*60)
     print(f"Building CryptoNote for {arch}")
-    print(f"{'='*60}")
+    print("="*60)
 
     dist_dir = f"dist/CryptoNote-{arch}"
 
@@ -26,27 +26,30 @@ def build_exe(arch: str):
         "--windowed",
         "--name", f"CryptoNote-{arch}",
         "--distpath", "dist",
-        "--buildpath", f"build-{arch}",
+        "--workpath", f"build-{arch}",
         "--specpath", f"build-{arch}",
         "app.py",
     ]
-    if Path("icon.ico").exists():
-        cmd.insert(3, "--icon=icon.ico")
 
     print(f"Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, check=False)
 
     if result.returncode == 0:
-        print(f"✓ Build successful: {dist_dir}")
+        print(f"[SUCCESS] Build successful: {dist_dir}")
+        exe_path = f"dist/CryptoNote-{arch}.exe"
+        if Path(exe_path).exists():
+            size_mb = Path(exe_path).stat().st_size / (1024*1024)
+            print(f"Executable size: {size_mb:.1f} MB")
         return True
     else:
-        print(f"✗ Build failed for {arch}")
+        print(f"[FAILED] Build failed for {arch}")
         return False
 
 def main():
     # Check dependencies
     try:
         import PyInstaller
+        print("PyInstaller found")
     except ImportError:
         print("PyInstaller not found. Installing...")
         subprocess.run([sys.executable, "-m", "pip", "install", "pyinstaller"], check=True)
@@ -60,16 +63,19 @@ def main():
 
     # Build for current architecture
     if current_arch.lower() in ("arm64", "aarch64"):
-        success &= build_exe("ARM64")
+        success = build_exe("ARM64")
     elif current_arch.lower() in ("x86_64", "amd64"):
-        success &= build_exe("x86_64")
+        success = build_exe("x86_64")
+    else:
+        print(f"Unknown architecture: {current_arch}")
+        return 1
 
     print("\n" + "="*60)
     if success:
-        print("✓ All builds completed successfully!")
-        print(f"Executables are in dist/ directory")
+        print("[SUCCESS] All builds completed!")
+        print("Executables are in dist/ directory")
     else:
-        print("✗ Some builds failed")
+        print("[FAILED] Some builds failed")
         return 1
 
     return 0
