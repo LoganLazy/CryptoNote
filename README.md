@@ -40,6 +40,9 @@ CryptoNote/
 ├── crypto.py        # 加密核心：Vault 类 + scrypt/AES-GCM
 ├── app.py           # Tkinter GUI
 ├── test_crypto.py   # 加密核心自测（13 项，全部通过）
+├── build_exe.py     # 一键打包 exe（自动检测架构）
+├── icon.ico         # 应用图标
+├── requirements.txt # 依赖（pycryptodome）
 └── README.md
 ```
 
