@@ -13,11 +13,17 @@ def build_exe(arch):
     print(f"Building CryptoNote for {arch}")
     print("="*60)
 
-    dist_dir = f"dist/CryptoNote-{arch}"
+    # 实际产物：dist/CryptoNote-{arch}.exe + build-{arch} 工作目录。
+    # 注意：不要删 dist/CryptoNote-{arch}——那是目录名，PyInstaller
+    # 用 --distpath dist 时从不创建它，删它等于什么都没清理。
+    exe_path = Path(f"dist/CryptoNote-{arch}.exe")
+    work_dir = Path(f"build-{arch}")
 
-    # Clean previous build
-    if Path(dist_dir).exists():
-        shutil.rmtree(dist_dir)
+    # Clean previous build outputs
+    if exe_path.exists():
+        exe_path.unlink()
+    if work_dir.exists():
+        shutil.rmtree(work_dir)
 
     # PyInstaller command
     cmd = [
@@ -25,6 +31,7 @@ def build_exe(arch):
         "--onefile",
         "--windowed",
         "--name", f"CryptoNote-{arch}",
+        "--icon", "icon.ico",
         "--distpath", "dist",
         "--workpath", f"build-{arch}",
         "--specpath", f"build-{arch}",
@@ -35,10 +42,9 @@ def build_exe(arch):
     result = subprocess.run(cmd, check=False)
 
     if result.returncode == 0:
-        print(f"[SUCCESS] Build successful: {dist_dir}")
-        exe_path = f"dist/CryptoNote-{arch}.exe"
-        if Path(exe_path).exists():
-            size_mb = Path(exe_path).stat().st_size / (1024*1024)
+        print(f"[SUCCESS] Build successful: {exe_path}")
+        if exe_path.exists():
+            size_mb = exe_path.stat().st_size / (1024*1024)
             print(f"Executable size: {size_mb:.1f} MB")
         return True
     else:

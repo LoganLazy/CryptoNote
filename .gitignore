@@ -36,3 +36,4 @@ venv.bak/
 .DS_Store
 notes.db
 notes.vault
+*.vault

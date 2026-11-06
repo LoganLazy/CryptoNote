@@ -30,6 +30,8 @@ SCRYPT_MAXMEM = 128 * 1024 * 1024
 SALT_BYTES = 16
 NONCE_BYTES = 12           # GCM 推荐 96-bit nonce
 
+TITLE_MAX_LENGTH = 256     # 笔记标题最长字符数（界面 + Vault 双层校验）
+
 # 解锁时用来校验主密码是否正确的固定标记（明文已知，靠 GCM 认证判断密码对错）。
 _CHECK_PLAINTEXT = b"CryptoNote.vault.check.v1"
 _CHECK_AAD = b"vault-check"
@@ -85,7 +87,7 @@ def _decrypt(key: bytes, blob: dict, aad: bytes) -> bytes:
         nonce = _b64d(blob["nonce"])
         ct = _b64d(blob["ct"])
         tag = _b64d(blob["tag"])
-    except (KeyError, ValueError, TypeError) as exc:
+    except (KeyError, ValueError, TypeError, AttributeError) as exc:
         raise VaultError("密文格式损坏") from exc
     cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
     cipher.update(aad)
@@ -93,6 +95,34 @@ def _decrypt(key: bytes, blob: dict, aad: bytes) -> bytes:
         return cipher.decrypt_and_verify(ct, tag)
     except ValueError as exc:
         raise WrongPassword("主密码错误或数据被篡改") from exc
+
+
+def _is_blob(value) -> bool:
+    """判断一个值是不是合法的密文块：含 nonce/ct/tag 三个字符串字段。"""
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("nonce"), str)
+        and isinstance(value.get("ct"), str)
+        and isinstance(value.get("tag"), str)
+    )
+
+
+def _validate_rec(rec) -> dict:
+    """校验一条笔记记录的结构：必须是 dict，且 title/body 都是合法密文块。
+
+    结构损坏统一转 VaultError，绝不让 KeyError/TypeError 逃到调用方。
+    """
+    if not isinstance(rec, dict) or not _is_blob(rec.get("title")) or not _is_blob(rec.get("body")):
+        raise VaultError("笔记数据损坏")
+    return rec
+
+
+def _check_title(title: str) -> None:
+    """校验标题：必须是字符串且不超过上限。"""
+    if not isinstance(title, str):
+        raise VaultError("标题必须是字符串")
+    if len(title) > TITLE_MAX_LENGTH:
+        raise VaultError(f"标题最多 {TITLE_MAX_LENGTH} 个字符")
 
 
 class Vault:
@@ -135,21 +165,31 @@ class Vault:
     def open(cls, path: str, password: str) -> "Vault":
         if not os.path.exists(path):
             raise VaultError("文件不存在")
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+            raise VaultError("文件损坏：不是有效的保险库文件") from exc
+        if not isinstance(raw, dict):
+            raise VaultError("文件损坏：不是有效的保险库文件")
         if raw.get("version") != VERSION:
             raise VaultError(f"不支持的文件版本: {raw.get('version')}")
         try:
             salt = _b64d(raw["kdf"]["salt"])
-        except (KeyError, ValueError, TypeError) as exc:
+        except (KeyError, ValueError, TypeError, AttributeError) as exc:
             raise VaultError("文件头损坏") from exc
+        if "check" not in raw:
+            raise VaultError("文件头损坏")
+        notes = raw.get("notes", {})
+        if not isinstance(notes, dict):
+            raise VaultError("文件损坏：笔记数据无效")
         key = derive_key(password, salt)
         # 校验主密码：解开 check 块，失败说明密码错或文件被篡改。
         _decrypt(key, raw["check"], _CHECK_AAD)
         data = {
             "salt": salt,
             "check": raw["check"],
-            "notes": dict(raw.get("notes", {})),
+            "notes": dict(notes),
         }
         return cls(path, key, data)
 
@@ -193,6 +233,12 @@ class Vault:
         """返回笔记元信息列表（已解密标题），按更新时间倒序。"""
         out = []
         for nid, rec in self._data["notes"].items():
+            try:
+                _validate_rec(rec)
+            except VaultError:
+                # 记录结构损坏：不让列表整体崩掉，显示占位标题。
+                out.append({"id": nid, "title": "（无法解密）", "updated": ""})
+                continue
             # 先查缓存，避免重复解密标题
             if nid in self._title_cache:
                 title = self._title_cache[nid]
@@ -200,9 +246,12 @@ class Vault:
                 try:
                     title = _decrypt(self._key, rec["title"], nid.encode("utf-8")).decode("utf-8")
                     self._title_cache[nid] = title
-                except VaultError:
+                except (VaultError, UnicodeDecodeError):
                     title = "（无法解密）"
-            out.append({"id": nid, "title": title, "updated": rec.get("updated", "")})
+            updated = rec.get("updated", "")
+            if not isinstance(updated, str):
+                updated = ""
+            out.append({"id": nid, "title": title, "updated": updated})
         out.sort(key=lambda x: x["updated"], reverse=True)
         return out
 
@@ -210,9 +259,14 @@ class Vault:
         rec = self._data["notes"].get(note_id)
         if rec is None:
             raise VaultError("笔记不存在")
-        return _decrypt(self._key, rec["body"], note_id.encode("utf-8")).decode("utf-8")
+        _validate_rec(rec)
+        try:
+            return _decrypt(self._key, rec["body"], note_id.encode("utf-8")).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise VaultError("笔记数据损坏") from exc
 
     def add_note(self, title: str, body: str = "") -> str:
+        _check_title(title)
         nid = secrets.token_hex(16)
         aad = nid.encode("utf-8")
         now = _now_iso()
@@ -230,6 +284,8 @@ class Vault:
         rec = self._data["notes"].get(note_id)
         if rec is None:
             raise VaultError("笔记不存在")
+        _validate_rec(rec)
+        _check_title(title)
         aad = note_id.encode("utf-8")
         rec["title"] = _encrypt(self._key, title.encode("utf-8"), aad)
         rec["body"] = _encrypt(self._key, body.encode("utf-8"), aad)
@@ -240,18 +296,28 @@ class Vault:
     def delete_note(self, note_id: str) -> None:
         if note_id not in self._data["notes"]:
             raise VaultError("笔记不存在")
+        _validate_rec(self._data["notes"][note_id])
         del self._data["notes"][note_id]
         self._title_cache.pop(note_id, None)  # 删除缓存
         self._save()
 
     def change_password(self, new_password: str) -> None:
         """改主密码：换 salt 重新派生密钥，全部笔记用新密钥重加密。"""
-        # 先把所有笔记解密出来（标题、正文）
+        # 先把所有笔记解密出来（标题、正文）。任一笔记损坏都直接抛错，
+        # 此时密钥尚未切换，原文件仍可用旧密码打开。
         plain = {}
         for nid, rec in self._data["notes"].items():
-            body = _decrypt(self._key, rec["body"], nid.encode("utf-8")).decode("utf-8")
-            title = self._title_cache.get(nid) or _decrypt(
-                self._key, rec["title"], nid.encode("utf-8")).decode("utf-8")
+            _validate_rec(rec)
+            try:
+                body = _decrypt(self._key, rec["body"], nid.encode("utf-8")).decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise VaultError("笔记数据损坏") from exc
+            title = self._title_cache.get(nid)
+            if not title:
+                try:
+                    title = _decrypt(self._key, rec["title"], nid.encode("utf-8")).decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise VaultError("笔记数据损坏") from exc
             plain[nid] = (body, title)
 
         new_salt = secrets.token_bytes(SALT_BYTES)

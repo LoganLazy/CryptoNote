@@ -17,6 +17,7 @@ import json
 import tkinter as tk
 from tkinter import font as tkfont
 from datetime import datetime
+from urllib.parse import urlparse
 
 import ttkbootstrap as tb
 import ttkbootstrap as ttk          # ttkbootstrap 顶层导出了大部分控件（带 bootstyle）
@@ -28,7 +29,7 @@ from ttkbootstrap.constants import (
 from ttkbootstrap.dialogs import Messagebox
 from tkinter import filedialog
 
-from crypto import Vault, VaultError, WrongPassword
+from crypto import Vault, VaultError, WrongPassword, TITLE_MAX_LENGTH
 
 APP_TITLE = "CryptoNote 加密记事本"
 DEFAULT_VAULT = "notes.vault"
@@ -93,6 +94,16 @@ def rt_dumps(text: str, spans, links=None) -> str:
 def rt_plaintext(raw: str) -> str:
     """从（可能是富文本的）正文里取出纯文本，供列表预览使用。"""
     return rt_loads(raw)[0]
+
+
+def is_safe_link_url(url) -> bool:
+    """超链接白名单：只允许 http/https，避免 file:// 等 scheme 交给系统打开。"""
+    if not isinstance(url, str):
+        return False
+    try:
+        return urlparse(url.strip()).scheme.lower() in ("http", "https")
+    except ValueError:
+        return False
 
 
 
@@ -344,6 +355,12 @@ class PasswordDialog(tk.Toplevel):
             self.ent2.delete(0, END)
             self.ent2.focus_set()
             return
+        if len(pw) < 6:
+            ans = Messagebox.yesno("密码偏短（少于 6 位），仍要继续？", APP_TITLE,
+                                   parent=self, buttons=["否:secondary", "是:primary"],
+                                   localize=False)
+            if ans != "是":
+                return
         self.result = pw
         self.destroy()
 
@@ -489,7 +506,8 @@ class MainView(ttk.Frame):
         self._autosave_on = tk.BooleanVar(value=True)
         self._wrap_on = tk.BooleanVar(value=True)
         self._links = []                 # [(start, end, url), ...] 当前笔记的超链接
-        self._link_map = {}              # {(start, end): url} for link lookup
+        self._link_tags = {}             # {tag 名: url}，每条链接一个 tag，tag 随文字移动
+        self._link_seq = 0               # 链接 tag 序号
         self._find_dialog = None
         self._filter_after = None        # 搜索框去抖定时器
         self._build()
@@ -546,9 +564,11 @@ class MainView(ttk.Frame):
         right = ttk.Frame(body, padding=(20, 16))
         right.pack(side=LEFT, fill=BOTH, expand=True)
 
-        self.ent_title = ttk.Entry(right, font=F_TITLE, bootstyle="primary")
+        self.ent_title = ttk.Entry(right, font=F_TITLE, bootstyle="primary",
+                                   validate="key",
+                                   validatecommand=(self.register(self._validate_title), "%P"))
         self.ent_title.pack(side=TOP, fill=X)
-        # 限制标题长度为 256 字符
+        # 限制标题长度为 256 字符：KeyPress 检查 + validatecommand（挡粘贴）+ Vault 层兜底
         self.ent_title.bind("<KeyPress>", self._on_title_press)
         self.ent_title.bind("<KeyPress>", self._mark_dirty, add="+")
         ttk.Separator(right, orient="horizontal").pack(side=TOP, fill=X, pady=(10, 8))
@@ -649,11 +669,28 @@ class MainView(ttk.Frame):
         }
         self._rt_tags = set()
 
-        # Configure link tag: blue underline
-        self.txt_body.tag_configure('link', foreground='#0066cc', underline=True)
-        self.txt_body.tag_bind('link', '<Button-1>', self._on_link_click)
-        self.txt_body.tag_bind('link', '<Enter>', lambda e: self.txt_body.config(cursor='hand2'))
-        self.txt_body.tag_bind('link', '<Leave>', lambda e: self.txt_body.config(cursor='arrow'))
+    def _configure_link_tag(self, name):
+        """给一条链接 tag 配蓝色下划线 + 点击/悬停行为。"""
+        self.txt_body.tag_configure(name, foreground='#0066cc', underline=True)
+        self.txt_body.tag_bind(name, '<Button-1>', self._on_link_click)
+        self.txt_body.tag_bind(name, '<Enter>', lambda e: self.txt_body.config(cursor='hand2'))
+        self.txt_body.tag_bind(name, '<Leave>', lambda e: self.txt_body.config(cursor='arrow'))
+
+    def _new_link_tag(self, url) -> str:
+        """新建一个已配置的链接 tag 并记下它的 URL，返回 tag 名。"""
+        name = f"link{self._link_seq}"
+        self._link_seq += 1
+        self._configure_link_tag(name)
+        self._link_tags[name] = url
+        return name
+
+    def _clear_link_tags(self):
+        """删掉全部链接 tag（加载另一条笔记前调用）。"""
+        for name in [t for t in self.txt_body.tag_names() if t.startswith("link")]:
+            try:
+                self.txt_body.tag_delete(name)
+            except tk.TclError:
+                pass
 
     def _tag_for_flags(self, flags: int) -> str:
         """惰性创建并返回某样式组合对应的 tag 名（rt<flags>）。"""
@@ -732,35 +769,34 @@ class MainView(ttk.Frame):
                                       f"1.0+{int(s)}c", f"1.0+{int(e)}c")
 
     def _apply_links(self, text, links):
-        """Apply link tags to text ranges."""
-        self.txt_body.tag_remove('link', '1.0', END)
-        if not hasattr(self, '_link_map'):
-            self._link_map = {}
-        self._link_map.clear()
+        """Apply link tags to text ranges.
+
+        每条链接一个独立 tag（link<N>），URL 存在 _link_tags 里。
+        tag 会随文字编辑自动移动，所以链接前面的文字被改动后，
+        保存时仍能按 tag 的当前范围找回 URL，不会丢链接。
+        """
+        self._clear_link_tags()
+        self._link_tags = {}
+        self._link_seq = 0
         for s, e, url in links:
+            name = self._new_link_tag(url)
             start = f"1.0+{int(s)}c"
             end = f"1.0+{int(e)}c"
-            self.txt_body.tag_add('link', start, end)
-            self._link_map[(s, e)] = url
+            self.txt_body.tag_add(name, start, end)
 
     def _on_link_click(self, event):
         """Handle link click: open URL in browser."""
-        if not hasattr(self, '_link_map'):
-            return
         idx = str(self.txt_body.index(f'@{event.x},{event.y}'))
-        link_ranges = self.txt_body.tag_ranges('link')
-        for k in range(0, len(link_ranges), 2):
-            start = str(link_ranges[k])
-            end = str(link_ranges[k + 1])
-            if self.txt_body.compare(start, '<=', idx) and self.txt_body.compare(idx, '<', end):
-                # Convert back to char positions
-                s = self._char_index(start)
-                e = self._char_index(end)
-                url = self._link_map.get((s, e))
-                if url:
-                    import webbrowser
-                    webbrowser.open(url)
-                return
+        for name, url in list(getattr(self, '_link_tags', {}).items()):
+            ranges = self.txt_body.tag_ranges(name)
+            for k in range(0, len(ranges), 2):
+                start = str(ranges[k])
+                end = str(ranges[k + 1])
+                if self.txt_body.compare(start, '<=', idx) and self.txt_body.compare(idx, '<', end):
+                    if is_safe_link_url(url):
+                        import webbrowser
+                        webbrowser.open(url)
+                    return
 
     def _collect_rich(self):
         """Collect text + styles + links for saving. Returns (text, spans, links)."""
@@ -793,19 +829,17 @@ class MainView(ttk.Frame):
                 spans.append((i, j, f))
             i = j
 
-        # Collect links from current 'link' tag ranges
+        # Collect links from per-link tags: tag 随文字移动，范围始终是
+        # 当前的，所以链接前面的文字被改动后也不会丢 URL。
         links = []
-        link_ranges = self.txt_body.tag_ranges('link')
-        for k in range(0, len(link_ranges), 2):
-            start_idx = str(link_ranges[k])
-            end_idx = str(link_ranges[k + 1])
-            a = self._char_index(start_idx)
-            b = self._char_index(end_idx)
-            # Look up URL from _link_map dict using char positions
-            if hasattr(self, '_link_map'):
-                url = self._link_map.get((a, b))
-                if url:
+        for name, url in getattr(self, '_link_tags', {}).items():
+            ranges = self.txt_body.tag_ranges(name)
+            for k in range(0, len(ranges), 2):
+                a = self._char_index(str(ranges[k]))
+                b = self._char_index(str(ranges[k + 1]))
+                if a < b:
                     links.append((a, b, url))
+        links.sort()
 
         return text, spans, links
 
@@ -973,6 +1007,14 @@ class MainView(ttk.Frame):
 
     # ---------- 标题输入限制 ----------
 
+    def _validate_title(self, proposed: str) -> bool:
+        """标题 Entry 校验（validatecommand）：新值长度不得超过上限。
+
+        validate="key" 下键盘输入、粘贴、程序性 insert 都会走这里；
+        返回 False 则本次改动被拒绝，标题保持原值。
+        """
+        return len(proposed) <= TITLE_MAX_LENGTH
+
     def _on_title_press(self, event):
         """限制标题长度不超过 256 字符。"""
         if len(self.ent_title.get()) > 256:
@@ -1084,18 +1126,19 @@ class MainView(ttk.Frame):
         url = askstring("Insert Link", "URL:", parent=self)
         if not url:
             return
+        if not is_safe_link_url(url):
+            Messagebox.show_warning("仅支持 http:// 或 https:// 链接", APP_TITLE, parent=self)
+            return
 
         if text:
             # Apply link to selection
             self._begin_change(discrete=True)
             start_str = str(start)
             end_str = str(end)
-            self.txt_body.tag_add('link', start_str, end_str)
-            if not hasattr(self, '_link_map'):
-                self._link_map = {}
+            name = self._new_link_tag(url)
+            self.txt_body.tag_add(name, start_str, end_str)
             s = int(self._char_index(start_str))
             e = int(self._char_index(end_str))
-            self._link_map[(s, e)] = url
             self._links.append((s, e, url))
             self._mark_dirty()
         else:
@@ -1105,12 +1148,10 @@ class MainView(ttk.Frame):
             insert_idx = str(self.txt_body.index("insert"))
             self.txt_body.insert(insert_idx, link_text)
             end_idx = str(self.txt_body.index(f"{insert_idx}+{len(link_text)}c"))
-            self.txt_body.tag_add('link', insert_idx, end_idx)
-            if not hasattr(self, '_link_map'):
-                self._link_map = {}
+            name = self._new_link_tag(url)
+            self.txt_body.tag_add(name, insert_idx, end_idx)
             s = int(self._char_index(insert_idx))
             e = int(self._char_index(end_idx))
-            self._link_map[(s, e)] = url
             self._links.append((s, e, url))
             self._mark_dirty()
 
@@ -1322,6 +1363,15 @@ class MainView(ttk.Frame):
                 card.pack(fill=X, pady=(0, 1))
                 self._cards[n["id"]] = card
 
+        # 按 shown 顺序重排已有卡片：pack_forget 后按顺序重新 pack，
+        # 不销毁重建（保留选中高亮与滚动位置）。不重排会导致编辑旧笔记
+        # 保存后数据已重排、界面卡片还停在老位置。
+        for n in shown:
+            card = self._cards.get(n["id"])
+            if card is not None:
+                card.pack_forget()
+                card.pack(fill=X, pady=(0, 1))
+
         if select_id and select_id in self._cards:
             self._highlight(select_id)
         elif self._current_id in self._cards:
@@ -1494,17 +1544,23 @@ class MainView(ttk.Frame):
         self._lock_after = self.after(AUTO_LOCK_MS, self._auto_lock)
 
     def _auto_lock(self):
-        """空闲超时锁定：绝不弹框等待（人不在），有改动就静默保存后直接锁。"""
-        if self._dirty and self._current_id is not None:
-            try:
-                title = self.ent_title.get()
-                text, spans = self._collect_rich()
-                self.vault.update_note(self._current_id, title, rt_dumps(text, spans))
-                self._dirty = False
-            except VaultError:
-                pass                    # 存不了也要锁，安全优先
-        self._set_status("空闲超时，已锁定")
-        self._do_lock()
+        """空闲超时锁定：绝不弹框等待（人不在），有改动就静默保存后直接锁。
+
+        保存失败也要锁（finally 保证 _do_lock 一定执行），绝不因保存
+        异常让保险库停留在解锁状态。
+        """
+        try:
+            if self._dirty and self._current_id is not None:
+                try:
+                    title = self.ent_title.get()
+                    text, spans, links = self._collect_rich()
+                    self.vault.update_note(self._current_id, title, rt_dumps(text, spans, links))
+                    self._dirty = False
+                except Exception:
+                    pass                # 存不了也要锁，安全优先
+            self._set_status("空闲超时，已锁定")
+        finally:
+            self._do_lock()
 
     def lock(self):
         # 手动锁定：仍尊重用户，对未保存改动给出确认。
