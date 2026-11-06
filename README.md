@@ -9,7 +9,7 @@
 - **防篡改**：GCM 自带完整性校验；用笔记 id 作为 AAD 绑定，防止条目被整体调换。
 - **原子落盘**：先写临时文件再替换，写一半断电也不会损坏库文件。
 - **空闲自动锁定**：5 分钟无操作自动回到解锁界面。
-- **纯运行时无需编译**：只依赖已安装的 `pycryptodome` + Python 标准库，Windows ARM64 直接可用。
+- **纯运行时无需编译**：只依赖 `pycryptodome` + `ttkbootstrap` + Python 标准库，Windows ARM64 直接可用。
 
 ## 运行
 
@@ -39,20 +39,31 @@ python app.py
 CryptoNote/
 ├── crypto.py        # 加密核心：Vault 类 + scrypt/AES-GCM
 ├── app.py           # Tkinter GUI
-├── test_crypto.py   # 加密核心自测（13 项，全部通过）
+├── test_crypto.py   # 加密核心自测（覆盖创建/读取、密码校验、篡改与调换检测、改密码、畸形文件）
+├── test_gui_smoke.py # GUI 冒烟测试（自动锁定、列表顺序、标题粘贴，需 xvfb-run）
+├── .github/workflows/ci.yml  # CI：加密测试 + GUI 冒烟测试 + 编译检查
 ├── build_exe.py     # 一键打包 exe（自动检测架构）
 ├── icon.ico         # 应用图标
-├── requirements.txt # 依赖（pycryptodome）
+├── requirements.txt # 依赖（pycryptodome + ttkbootstrap）
 └── README.md
 ```
 
 ## 测试
 
 ```bash
+pip install -r requirements.txt
 python test_crypto.py
 ```
 
-覆盖：创建/读取、正确密码解密、错误密码拒绝、密文篡改检测、条目调换检测、改密码后新旧密码行为、原子落盘后重新打开。
+覆盖：创建/读取、正确密码解密、错误密码拒绝、密文篡改检测、条目调换检测、改密码后新旧密码行为、原子落盘后重新打开、畸形文件（截断 JSON、非对象、缺 check 块、缺 body 字段）统一报 VaultError、标题超长拒绝。
+
+GUI 冒烟测试（需虚拟显示器，Linux 下用 `xvfb-run`）：
+
+```bash
+xvfb-run -a python test_gui_smoke.py
+```
+
+覆盖：应用启动与解锁界面、自动锁定（有未保存改动也不崩溃、一定上锁、超链接不丢失）、列表顺序（编辑旧笔记保存后卡片顺序跟上）、标题粘贴长度限制。
 
 ## 库文件格式
 
@@ -80,7 +91,7 @@ JSON，仅含密文与公开的 KDF 参数（salt、scrypt 参数），不含任
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --name CryptoNote app.py
+pyinstaller --onefile --windowed --name CryptoNote --icon icon.ico app.py
 ```
 
 产物在 `dist/CryptoNote.exe`。注意 PyInstaller 在 ARM64 上会打出 ARM64 的 exe，只能在 ARM 设备上跑。
